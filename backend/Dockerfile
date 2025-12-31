@@ -20,6 +20,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     git \
     wget \
+    awscli \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=go-builder /build/server /app/server
@@ -45,4 +46,7 @@ EXPOSE 8080
 
 VOLUME ["/app/data"]
 
-CMD ["/app/server"]
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+ENTRYPOINT ["/app/entrypoint.sh"]
