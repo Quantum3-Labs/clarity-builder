@@ -1,10 +1,15 @@
 package main
 
 import (
+	"context"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
+	"time"
 
 	docs "github.com/Quantum3-Labs/stacks-builder/backend/docs"
 	"github.com/Quantum3-Labs/stacks-builder/backend/internal/api"
@@ -196,7 +201,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
-	defer db.Close()
 
 	// Initialize query logging service
 	qr := querylog.NewRepository(db)
@@ -220,9 +224,46 @@ func main() {
 		port = "8080"
 	}
 
-	// Start server
-	log.Printf("Starting server on port %s...", port)
-	if err := router.Run(":" + port); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	// Create HTTP server
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: router,
 	}
+
+	// Channel to receive shutdown signals
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// Start server in goroutine
+	go func() {
+		log.Printf("Server starting on port %s", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	// Wait for shutdown signal
+	sig := <-quit
+	log.Printf("Received signal: %v. Initiating graceful shutdown...", sig)
+
+	// Create shutdown context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Shutdown HTTP server (stops accepting new requests, waits for in-flight)
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("HTTP server shutdown error: %v", err)
+	} else {
+		log.Println("HTTP server stopped")
+	}
+
+	// Flush async query logs
+	qs.FlushAndWait(5 * time.Second)
+
+	// Close database (includes WAL checkpoint)
+	if err := database.Close(); err != nil {
+		log.Printf("Database close error: %v", err)
+	}
+
+	log.Println("Graceful shutdown complete")
 }

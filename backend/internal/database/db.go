@@ -3,14 +3,24 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"os"
 	"strings"
+	"sync"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
+var (
+	globalDB *sql.DB
+	dbMutex  sync.Mutex
+)
+
 // InitDB initializes the database connection and runs migrations
 func InitDB() (*sql.DB, error) {
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+
 	dbPath := os.Getenv("DATABASE_PATH")
 	if dbPath == "" {
 		dbPath = "./data/clarity_coder.db"
@@ -24,20 +34,90 @@ func InitDB() (*sql.DB, error) {
 
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
 	// Test connection
 	if err := db.Ping(); err != nil {
+		db.Close()
 		return nil, err
 	}
+
+	// Enable WAL mode - critical for S3 sync safety
+	// WAL keeps main .db file always consistent
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
+	}
+
+	// NORMAL sync is safe with WAL and improves performance
+	if _, err := db.Exec("PRAGMA synchronous=NORMAL"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to set synchronous mode: %w", err)
+	}
+
+	// Increase busy timeout to handle concurrent access
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		log.Printf("Warning: failed to set busy_timeout: %v", err)
+	}
+
+	globalDB = db
 
 	// Run migrations
 	if err := runMigrations(db); err != nil {
-		return nil, err
+		db.Close()
+		globalDB = nil
+		return nil, fmt.Errorf("failed to run migrations: %w", err)
 	}
 
 	return db, nil
+}
+
+// Checkpoint forces WAL to merge into main database file
+// Call this before syncing to S3
+func Checkpoint() error {
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+
+	if globalDB == nil {
+		return nil
+	}
+
+	log.Println("Running SQLite WAL checkpoint...")
+	_, err := globalDB.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	if err != nil {
+		return fmt.Errorf("WAL checkpoint failed: %w", err)
+	}
+	log.Println("WAL checkpoint complete")
+	return nil
+}
+
+// Close performs clean shutdown: checkpoint + close
+func Close() error {
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+
+	if globalDB == nil {
+		return nil
+	}
+
+	// Checkpoint first to merge WAL
+	log.Println("Closing database...")
+	if _, err := globalDB.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		log.Printf("Warning: final WAL checkpoint failed: %v", err)
+	}
+
+	err := globalDB.Close()
+	globalDB = nil
+	log.Println("Database closed")
+	return err
+}
+
+// GetDB returns the global database instance
+func GetDB() *sql.DB {
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+	return globalDB
 }
 
 // runMigrations creates the necessary database tables
